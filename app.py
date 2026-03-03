@@ -7,18 +7,23 @@ from dotenv import load_dotenv
 from model import run_full_model
 from excel_export import export_to_excel
 
-load_dotenv()
-AV_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+import os
+import streamlit as st
 
-st.set_page_config(page_title="Equity Research Model", layout="wide")
-st.title("Equity Research Model")
+def get_av_key():
+    # First try Streamlit Cloud secrets
+    if "ALPHA_VANTAGE_API_KEY" in st.secrets:
+        return st.secrets["ALPHA_VANTAGE_API_KEY"].strip()
+    # Then try local environment (.env or system)
+    return os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
 
-# Key status (never display the key)
+AV_KEY = get_av_key()
+
+# Key status (never display the key itself)
 if AV_KEY:
-    st.caption("Alpha Vantage key loaded from .env ✅ (no need to re-enter)")
+    st.caption("Alpha Vantage key loaded ✅")
 else:
-    st.warning("Alpha Vantage key not found in .env. (App still works using yfinance.)")
-
+    st.warning("Alpha Vantage key not found. (App still works using yfinance.)")
 # ---------------- Sidebar ----------------
 st.sidebar.header("Core")
 ticker = st.sidebar.text_input("Company Ticker", value="GOOG").strip().upper()
