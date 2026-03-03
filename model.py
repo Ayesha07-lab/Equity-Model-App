@@ -3,9 +3,7 @@ import pandas as pd
 import yfinance as yf
 
 
-# ------------------------
-# Helpers
-# ------------------------
+# ---------------- Helpers ----------------
 def _safe_float(x, default=np.nan):
     try:
         if x is None:
@@ -40,24 +38,22 @@ def _cagr(values: pd.Series):
     return float((end / start) ** (1 / n) - 1)
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, x)))
+
+
 def _linear_ramp(start: float, end: float, n: int) -> np.ndarray:
     if n <= 1:
         return np.array([end], dtype=float)
     return np.linspace(start, end, n, dtype=float)
 
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return float(max(lo, min(hi, x)))
-
-
-# ------------------------
-# Data pulls
-# ------------------------
+# ---------------- Data pulls ----------------
 def get_info_snapshot(ticker: str) -> dict:
     t = yf.Ticker(ticker)
     info = t.get_info() or {}
 
-    price = _safe_float(info.get("currentPrice"))  # sometimes missing
+    price = _safe_float(info.get("currentPrice"))
     if np.isnan(price):
         price = _safe_float(info.get("regularMarketPrice"))
 
@@ -104,8 +100,6 @@ def get_hist_financials(ticker: str) -> pd.DataFrame:
     revenue = get_series(inc, ["Total Revenue", "TotalRevenue", "Revenue"])
     ebit = get_series(inc, ["Ebit", "EBIT", "Operating Income", "OperatingIncome"])
     net_income = get_series(inc, ["Net Income", "NetIncome", "Net Income Common Stockholders"])
-
-    # EBITDA sometimes exists; else approximate as EBIT + D&A later
     ebitda = get_series(inc, ["Ebitda", "EBITDA"])
 
     da = get_series(cf, ["Depreciation And Amortization", "Depreciation", "Depreciation & Amortization"])
@@ -116,9 +110,7 @@ def get_hist_financials(ticker: str) -> pd.DataFrame:
 
     curr_assets = get_series(bs, ["Total Current Assets", "Current Assets"])
     curr_liab = get_series(bs, ["Total Current Liabilities", "Current Liabilities"])
-    wc = []
-    for a, l in zip(curr_assets, curr_liab):
-        wc.append(np.nan if (np.isnan(a) or np.isnan(l)) else (a - l))
+    wc = [np.nan if (np.isnan(a) or np.isnan(l)) else (a - l) for a, l in zip(curr_assets, curr_liab)]
 
     df = pd.DataFrame(
         {
@@ -135,19 +127,16 @@ def get_hist_financials(ticker: str) -> pd.DataFrame:
         }
     ).dropna(subset=["Revenue"]).sort_values("Year").reset_index(drop=True)
 
-    # Fill EBITDA if missing using EBIT + D&A when possible
+    # Fill EBITDA if missing using EBIT + D&A
     missing = df["EBITDA"].isna()
     df.loc[missing, "EBITDA"] = df.loc[missing, "EBIT"] + df.loc[missing, "D&A"]
 
     df["EBIT_Margin"] = df["EBIT"] / df["Revenue"]
     df["EBITDA_Margin"] = df["EBITDA"] / df["Revenue"]
-
     return df
 
 
-# ------------------------
-# Comps
-# ------------------------
+# ---------------- Comps ----------------
 def fetch_comps(tickers: list[str]) -> pd.DataFrame:
     rows = []
     for tk in tickers:
@@ -188,26 +177,21 @@ def fetch_comps(tickers: list[str]) -> pd.DataFrame:
 
 
 def infer_exit_multiple(comps_df: pd.DataFrame) -> dict:
-    """
-    Auto pick median EV/EBITDA; fallback to EV/Revenue if EV/EBITDA not usable.
-    """
     if comps_df is None or comps_df.empty:
-        return {"method": "manual_default", "multiple": np.nan}
+        return {"basis": "EV/EBITDA", "source": "NO_COMPS", "multiple": np.nan}
 
     ev_ebitda_med = _nanmedian(comps_df["EV/EBITDA"], default=np.nan)
     if not np.isnan(ev_ebitda_med) and ev_ebitda_med > 0:
-        return {"method": "EV/EBITDA_median", "multiple": float(ev_ebitda_med)}
+        return {"basis": "EV/EBITDA", "source": "MEDIAN_COMPS", "multiple": float(ev_ebitda_med)}
 
     ev_rev_med = _nanmedian(comps_df["EV/Revenue"], default=np.nan)
     if not np.isnan(ev_rev_med) and ev_rev_med > 0:
-        return {"method": "EV/Revenue_median", "multiple": float(ev_rev_med)}
+        return {"basis": "EV/Revenue", "source": "MEDIAN_COMPS", "multiple": float(ev_rev_med)}
 
-    return {"method": "manual_default", "multiple": np.nan}
+    return {"basis": "EV/EBITDA", "source": "COMPS_INVALID", "multiple": np.nan}
 
 
-# ------------------------
-# WACC
-# ------------------------
+# ---------------- WACC build ----------------
 def build_wacc(
     market_cap: float,
     total_debt: float,
@@ -215,39 +199,33 @@ def build_wacc(
     beta: float,
     rf: float,
     erp: float,
-    cost_of_debt: float,
-    target_debt_weight: float | None = None,
+    cod: float,
+    target_debt_weight: float | None,
 ) -> dict:
-    """
-    Auto WACC build (CAPM + after-tax debt).
-    If target_debt_weight is provided, use it; otherwise weight by market cap and debt.
-    """
     tax_rate = _clamp(tax_rate, 0.0, 0.5)
+    beta = 1.0 if (np.isnan(beta) or beta <= 0) else float(beta)
 
-    ke = rf + beta * erp
-    kd = cost_of_debt
-    kd_at = kd * (1 - tax_rate)
+    ke = float(rf + beta * erp)
+    kd = float(cod)
+    kd_at = float(kd * (1 - tax_rate))
 
     if target_debt_weight is None or np.isnan(target_debt_weight):
-        E = market_cap
-        D = total_debt
-        if np.isnan(E) or E <= 0:
-            E = 0.0
-        if np.isnan(D) or D < 0:
-            D = 0.0
+        E = 0.0 if (np.isnan(market_cap) or market_cap <= 0) else float(market_cap)
+        D = 0.0 if (np.isnan(total_debt) or total_debt < 0) else float(total_debt)
         V = E + D
         if V <= 0:
-            wd = 0.0
-            we = 1.0
+            wd, we = 0.0, 1.0
         else:
-            wd = D / V
-            we = E / V
+            wd, we = D / V, E / V
     else:
         wd = _clamp(float(target_debt_weight), 0.0, 0.95)
         we = 1.0 - wd
 
-    wacc = we * ke + wd * kd_at
+    wacc = float(we * ke + wd * kd_at)
     return {
+        "rf": float(rf),
+        "erp": float(erp),
+        "beta": float(beta),
         "cost_of_equity": float(ke),
         "cost_of_debt": float(kd),
         "after_tax_cost_of_debt": float(kd_at),
@@ -257,26 +235,24 @@ def build_wacc(
     }
 
 
-# ------------------------
-# Forecast + DCF
-# ------------------------
+# ---------------- Forecast + DCF ----------------
 def build_forecast(
     hist_df: pd.DataFrame,
     years: int,
-    rev_growth_start: float,
-    rev_growth_end: float,
-    ebit_margin_start: float,
-    ebit_margin_end: float,
+    g_start: float,
+    g_end: float,
+    m_start: float,
+    m_end: float,
     da_pct_rev: float,
     capex_pct_rev: float,
     wc_pct_rev: float,
     tax_rate: float,
-):
+) -> pd.DataFrame:
     last_year = int(hist_df["Year"].iloc[-1])
     yrs = [last_year + i for i in range(1, years + 1)]
 
     rev0 = float(hist_df["Revenue"].iloc[-1])
-    growth_path = _linear_ramp(rev_growth_start, rev_growth_end, years)
+    growth_path = _linear_ramp(g_start, g_end, years)
 
     revenue = []
     cur = rev0
@@ -285,8 +261,8 @@ def build_forecast(
         revenue.append(cur)
     revenue = np.array(revenue, dtype=float)
 
-    ebit_margin_path = _linear_ramp(ebit_margin_start, ebit_margin_end, years)
-    ebit = revenue * ebit_margin_path
+    margin_path = _linear_ramp(m_start, m_end, years)
+    ebit = revenue * margin_path
     nopat = ebit * (1 - _clamp(tax_rate, 0.0, 0.5))
 
     da = revenue * da_pct_rev
@@ -303,7 +279,7 @@ def build_forecast(
             "Year": yrs,
             "Revenue": revenue,
             "Rev_Growth": growth_path,
-            "EBIT_Margin": ebit_margin_path,
+            "EBIT_Margin": margin_path,
             "EBIT": ebit,
             "NOPAT": nopat,
             "D&A": da,
@@ -330,19 +306,14 @@ def terminal_value_pgm(fcff_last: float, wacc: float, tg: float) -> float:
 def terminal_value_exit_multiple(
     forecast_df: pd.DataFrame,
     exit_multiple: float,
-    multiple_basis: str,
-):
-    """
-    multiple_basis: 'EV/EBITDA' or 'EV/Revenue'
-    Uses final forecast year EBITDA proxy or Revenue.
-    EBITDA proxy = EBIT + D&A in final year.
-    """
+    basis: str,
+) -> float:
     last = forecast_df.iloc[-1]
-    if multiple_basis == "EV/Revenue":
+    if basis == "EV/Revenue":
         base = float(last["Revenue"])
     else:
-        base = float(last["EBIT"] + last["D&A"])
-    if base <= 0 or np.isnan(exit_multiple):
+        base = float(last["EBIT"] + last["D&A"])  # EBITDA proxy
+    if base <= 0 or np.isnan(exit_multiple) or exit_multiple <= 0:
         return np.nan
     return float(exit_multiple * base)
 
@@ -351,11 +322,10 @@ def dcf_enterprise_value(
     forecast_df: pd.DataFrame,
     wacc: float,
     tg: float,
-    use_exit_multiple: bool,
     exit_multiple: float,
-    multiple_basis: str,
+    exit_basis: str,
     blend_weight_pgm: float,
-):
+) -> dict:
     wacc = float(wacc)
     tg = float(tg)
     blend_weight_pgm = _clamp(float(blend_weight_pgm), 0.0, 1.0)
@@ -365,24 +335,18 @@ def dcf_enterprise_value(
     fcff_last = float(forecast_df["FCFF"].iloc[-1])
     tv_pgm = terminal_value_pgm(fcff_last, wacc=wacc, tg=tg)
 
-    tv_exit = np.nan
-    if use_exit_multiple:
-        tv_exit = terminal_value_exit_multiple(forecast_df, exit_multiple, multiple_basis)
+    tv_exit = terminal_value_exit_multiple(forecast_df, float(exit_multiple), exit_basis)
 
-    # If exit multiple is not usable, fall back to PGM 100%
-    if use_exit_multiple and (np.isnan(tv_exit) or tv_exit <= 0):
+    # If exit multiple invalid, fall back to 100% PGM
+    use_blend = True
+    if np.isnan(tv_exit) or tv_exit <= 0:
         blend_weight_pgm = 1.0
+        use_blend = False
 
-    tv_blended = (
-        (blend_weight_pgm * tv_pgm) + ((1.0 - blend_weight_pgm) * tv_exit)
-        if use_exit_multiple
-        else tv_pgm
-    )
+    tv_blended = (blend_weight_pgm * tv_pgm) + ((1.0 - blend_weight_pgm) * tv_exit) if use_blend else tv_pgm
 
-    # discount terminal value to present
     n = len(forecast_df)
     pv_tv = float(tv_blended / ((1 + wacc) ** n))
-
     ev = float(pv_fcff + pv_tv)
 
     return {
@@ -392,7 +356,7 @@ def dcf_enterprise_value(
         "TV_Blended": tv_blended,
         "PV_TerminalValue": pv_tv,
         "EnterpriseValue": ev,
-        "blend_weight_pgm": blend_weight_pgm,
+        "blend_weight_pgm_used": blend_weight_pgm,
     }
 
 
@@ -400,9 +364,8 @@ def sensitivity_ev(
     forecast_df: pd.DataFrame,
     wacc_grid: list[float],
     tg_grid: list[float],
-    use_exit_multiple: bool,
     exit_multiple: float,
-    multiple_basis: str,
+    exit_basis: str,
     blend_weight_pgm: float,
 ) -> pd.DataFrame:
     out = []
@@ -416,9 +379,8 @@ def sensitivity_ev(
                     forecast_df,
                     wacc=w,
                     tg=g,
-                    use_exit_multiple=use_exit_multiple,
                     exit_multiple=exit_multiple,
-                    multiple_basis=multiple_basis,
+                    exit_basis=exit_basis,
                     blend_weight_pgm=blend_weight_pgm,
                 )["EnterpriseValue"]
                 row[f"g={g:.2%}"] = ev
@@ -426,35 +388,34 @@ def sensitivity_ev(
     return pd.DataFrame(out)
 
 
-# ------------------------
-# Orchestrator (auto-first, override-always)
-# ------------------------
+# ---------------- The ONE signature app.py uses ----------------
 def run_full_model(
     ticker: str,
     comps_list: list[str],
-    # Scenario controls
     forecast_years: int,
+    terminal_growth: float,
+    blend_weight_pgm: float,
+    # scenario deltas
+    fade_to_growth: float,
     bull_growth_delta: float,
     weak_growth_delta: float,
     bull_margin_delta: float,
     weak_margin_delta: float,
-    fade_to_growth: float,
-    # Tax
+    # overrides: tax + driver ratios
     tax_rate: float,
     tax_override: bool,
-    # Drivers overrides
     da_override: bool,
     da_pct_rev_override: float,
     capex_override: bool,
     capex_pct_rev_override: float,
     wc_override: bool,
     wc_pct_rev_override: float,
-    # Shares / net debt overrides
+    # overrides: shares + net debt
     shares_override: bool,
     shares_override_value: float,
     net_debt_override: bool,
     net_debt_override_value: float,
-    # WACC controls
+    # WACC build / override
     wacc_override: bool,
     wacc_override_value: float,
     rf: float,
@@ -464,12 +425,10 @@ def run_full_model(
     cod: float,
     target_debt_weight_override: bool,
     target_debt_weight_value: float,
-    # Terminal controls
-    terminal_growth: float,
+    # terminal exit multiple override
     exit_multiple_override: bool,
     exit_multiple_override_value: float,
-    blend_weight_pgm: float,
-):
+) -> dict:
     ticker = ticker.strip().upper()
     if not ticker:
         raise ValueError("Ticker is required.")
@@ -477,27 +436,21 @@ def run_full_model(
     info = get_info_snapshot(ticker)
     hist = get_hist_financials(ticker)
 
-    # ---- Tax auto default
-    if not tax_override:
-        # effective tax approximation: clamp your input if user doesn't override
-        tax = _clamp(float(tax_rate), 0.10, 0.30)
-    else:
-        tax = _clamp(float(tax_rate), 0.0, 0.5)
+    # Tax
+    tax = _clamp(float(tax_rate), 0.0, 0.5) if tax_override else _clamp(float(tax_rate), 0.10, 0.30)
 
-    # ---- Driver autos from history
+    # Autos from history
     rev_cagr = _cagr(hist["Revenue"].tail(min(5, len(hist))))
     if np.isnan(rev_cagr):
         rev_cagr = 0.08
 
-    ebit_m_start_auto = _nanmedian(hist["EBIT_Margin"].tail(min(3, len(hist))), default=0.20)
-    ebit_m_start_auto = _clamp(ebit_m_start_auto, 0.02, 0.60)
+    m_start_auto = _nanmedian(hist["EBIT_Margin"].tail(min(3, len(hist))), default=0.20)
+    m_start_auto = _clamp(m_start_auto, 0.02, 0.60)
 
-    # Fade growth: start ~ historical, end = fade_to_growth (user-set)
-    base_g_start = float(rev_cagr)
-    base_g_end = float(fade_to_growth)
+    g_start_base = float(rev_cagr)
+    g_end_base = float(fade_to_growth)
 
-    # Margin target: slight improvement from start, capped
-    base_m_end = _clamp(ebit_m_start_auto + 0.01, 0.02, 0.65)
+    m_end_base = _clamp(m_start_auto + 0.01, 0.02, 0.65)
 
     da_pct_auto = _nanmedian((hist["D&A"] / hist["Revenue"]).tail(min(3, len(hist))), default=0.04)
     capex_pct_auto = _nanmedian((hist["CapEx"] / hist["Revenue"]).tail(min(3, len(hist))), default=0.05)
@@ -507,95 +460,74 @@ def run_full_model(
     capex_pct = float(capex_pct_rev_override) if capex_override else float(capex_pct_auto)
     wc_pct = float(wc_pct_rev_override) if wc_override else float(wc_pct_auto)
 
-    # Clean driver bounds
     da_pct = _clamp(da_pct, 0.0, 0.20)
     capex_pct = _clamp(capex_pct, 0.0, 0.30)
     wc_pct = _clamp(wc_pct, -0.10, 0.30)
 
-    # ---- Shares + Net debt
-    shares = info["shares_out"]
-    if shares_override:
-        shares = float(shares_override_value)
+    # Shares + Net debt
+    shares = float(shares_override_value) if shares_override else info["shares_out"]
 
-    # net debt from balance sheet latest debt-cash if possible
     last_cash = float(hist["Cash"].iloc[-1]) if not np.isnan(hist["Cash"].iloc[-1]) else np.nan
     last_debt = float(hist["Debt"].iloc[-1]) if not np.isnan(hist["Debt"].iloc[-1]) else np.nan
     net_debt_auto = (last_debt - last_cash) if (not np.isnan(last_debt) and not np.isnan(last_cash)) else np.nan
+    net_debt = float(net_debt_override_value) if net_debt_override else net_debt_auto
 
-    net_debt = net_debt_auto
-    if net_debt_override:
-        net_debt = float(net_debt_override_value)
-
-    # ---- Comps + exit multiple auto
+    # Comps + exit multiple auto/override
     comps_df = fetch_comps(comps_list) if comps_list else pd.DataFrame()
-    exit_infer = infer_exit_multiple(comps_df)
-
-    multiple_basis = "EV/EBITDA" if exit_infer["method"].startswith("EV/EBITDA") else "EV/Revenue"
-    exit_multiple = exit_infer["multiple"]
+    exit_auto = infer_exit_multiple(comps_df)
+    exit_basis = exit_auto["basis"]
+    exit_multiple = float(exit_auto["multiple"]) if not np.isnan(exit_auto["multiple"]) else np.nan
 
     if exit_multiple_override:
         exit_multiple = float(exit_multiple_override_value)
-        # If user overrides, we assume they mean EV/EBITDA unless they’re clearly using EV/Revenue;
-        # keep basis as inferred unless it was empty, then default to EV/EBITDA.
-        if multiple_basis not in {"EV/EBITDA", "EV/Revenue"}:
-            multiple_basis = "EV/EBITDA"
 
-    use_exit_multiple = True  # always on; will gracefully fall back to PGM if unusable
-
-    # ---- WACC
-    beta = info["beta"]
-    if beta_override:
-        beta = float(beta_override_value)
+    # WACC build / override
+    beta = float(beta_override_value) if beta_override else info["beta"]
     if np.isnan(beta) or beta <= 0:
         beta = 1.0
 
-    market_cap = info["market_cap"]
-    total_debt_for_wacc = last_debt
-
     target_dw = float(target_debt_weight_value) if target_debt_weight_override else np.nan
-
     wacc_build = build_wacc(
-        market_cap=market_cap,
-        total_debt=total_debt_for_wacc,
+        market_cap=info["market_cap"],
+        total_debt=last_debt,
         tax_rate=tax,
         beta=beta,
         rf=float(rf),
         erp=float(erp),
-        cost_of_debt=float(cod),
+        cod=float(cod),
         target_debt_weight=target_dw if target_debt_weight_override else None,
     )
-
     wacc = float(wacc_override_value) if wacc_override else float(wacc_build["wacc"])
     wacc = _clamp(wacc, 0.01, 0.30)
 
-    # ---- Build scenarios (auto-first + deltas)
+    # Scenarios
     scenarios = {
         "Bull": {
-            "g_start": base_g_start + float(bull_growth_delta),
-            "g_end": base_g_end + float(bull_growth_delta) * 0.5,
-            "m_start": ebit_m_start_auto + float(bull_margin_delta),
-            "m_end": base_m_end + float(bull_margin_delta),
+            "g_start": g_start_base + float(bull_growth_delta),
+            "g_end": g_end_base + float(bull_growth_delta) * 0.5,
+            "m_start": m_start_auto + float(bull_margin_delta),
+            "m_end": m_end_base + float(bull_margin_delta),
         },
         "Base": {
-            "g_start": base_g_start,
-            "g_end": base_g_end,
-            "m_start": ebit_m_start_auto,
-            "m_end": base_m_end,
+            "g_start": g_start_base,
+            "g_end": g_end_base,
+            "m_start": m_start_auto,
+            "m_end": m_end_base,
         },
         "Weak": {
-            "g_start": base_g_start + float(weak_growth_delta),
-            "g_end": base_g_end + float(weak_growth_delta) * 0.5,
-            "m_start": ebit_m_start_auto + float(weak_margin_delta),
-            "m_end": base_m_end + float(weak_margin_delta),
+            "g_start": g_start_base + float(weak_growth_delta),
+            "g_end": g_end_base + float(weak_growth_delta) * 0.5,
+            "m_start": m_start_auto + float(weak_margin_delta),
+            "m_end": m_end_base + float(weak_margin_delta),
         },
     }
 
-    # Clamp scenario growth & margin to sane bounds
+    # Clamp scenario values
     for s in scenarios.values():
         s["g_start"] = _clamp(s["g_start"], -0.20, 0.50)
-        s["g_end"] = _clamp(s["g_end"], -0.05, 0.15)
-        s["m_start"] = _clamp(s["m_start"], 0.01, 0.70)
-        s["m_end"] = _clamp(s["m_end"], 0.01, 0.75)
+        s["g_end"] = _clamp(s["g_end"], -0.05, 0.20)
+        s["m_start"] = _clamp(s["m_start"], 0.01, 0.75)
+        s["m_end"] = _clamp(s["m_end"], 0.01, 0.80)
 
     scenario_rows = []
     scenario_detail = {}
@@ -604,10 +536,10 @@ def run_full_model(
         fc = build_forecast(
             hist_df=hist,
             years=int(forecast_years),
-            rev_growth_start=float(p["g_start"]),
-            rev_growth_end=float(p["g_end"]),
-            ebit_margin_start=float(p["m_start"]),
-            ebit_margin_end=float(p["m_end"]),
+            g_start=float(p["g_start"]),
+            g_end=float(p["g_end"]),
+            m_start=float(p["m_start"]),
+            m_end=float(p["m_end"]),
             da_pct_rev=float(da_pct),
             capex_pct_rev=float(capex_pct),
             wc_pct_rev=float(wc_pct),
@@ -618,9 +550,8 @@ def run_full_model(
             forecast_df=fc,
             wacc=wacc,
             tg=float(terminal_growth),
-            use_exit_multiple=use_exit_multiple,
             exit_multiple=float(exit_multiple) if not np.isnan(exit_multiple) else np.nan,
-            multiple_basis=multiple_basis,
+            exit_basis=exit_basis,
             blend_weight_pgm=float(blend_weight_pgm),
         )
 
@@ -628,18 +559,18 @@ def run_full_model(
         equity = np.nan if np.isnan(net_debt) else (ev - float(net_debt))
 
         per_share = np.nan
-        if not np.isnan(equity) and not np.isnan(shares) and shares > 0:
+        if not np.isnan(equity) and not np.isnan(shares) and shares and shares > 0:
             per_share = equity / shares
 
         scenario_rows.append(
             {
                 "Scenario": name,
+                "WACC": wacc,
+                "TGR": float(terminal_growth),
                 "RevGrowth_Start": float(p["g_start"]),
                 "RevGrowth_End": float(p["g_end"]),
                 "EBITMargin_Start": float(p["m_start"]),
                 "EBITMargin_End": float(p["m_end"]),
-                "WACC": wacc,
-                "TGR": float(terminal_growth),
                 "EV": ev,
                 "EquityValue": equity,
                 "PerShare": per_share,
@@ -651,34 +582,33 @@ def run_full_model(
             }
         )
 
-        scenario_detail[name] = {
-            "forecast_df": fc,
-            "dcf_details": dcf,
-        }
+        scenario_detail[name] = {"forecast_df": fc, "dcf_details": dcf}
 
     scen_df = pd.DataFrame(scenario_rows)
-    scen_df["ScenarioRank"] = scen_df["Scenario"].map({"Bull": 0, "Base": 1, "Weak": 2})
-    scen_df = scen_df.sort_values("ScenarioRank").drop(columns=["ScenarioRank"]).reset_index(drop=True)
+    scen_df["Rank"] = scen_df["Scenario"].map({"Bull": 0, "Base": 1, "Weak": 2})
+    scen_df = scen_df.sort_values("Rank").drop(columns=["Rank"]).reset_index(drop=True)
 
-    # Headline = Base
-    base = scen_df[scen_df["Scenario"] == "Base"].iloc[0]
+    base_row = scen_df[scen_df["Scenario"] == "Base"].iloc[0]
+
     headline = {
+        "Ticker": ticker,
         "Price": info["price"],
         "MarketCap": info["market_cap"],
         "SharesOut": shares,
         "NetDebt": net_debt,
         "WACC": wacc,
         "TGR": float(terminal_growth),
-        "ExitMultiple": float(exit_multiple) if not np.isnan(exit_multiple) else np.nan,
-        "ExitMultipleBasis": multiple_basis,
-        "ExitMultipleSource": exit_infer["method"] if not exit_multiple_override else "OVERRIDE",
-        "BlendWeightPGM": float(blend_weight_pgm),
-        "EV_Base": float(base["EV"]),
-        "Equity_Base": float(base["EquityValue"]) if not np.isnan(base["EquityValue"]) else np.nan,
-        "PerShare_Base": float(base["PerShare"]) if not np.isnan(base["PerShare"]) else np.nan,
+        "ExitMultiple": exit_multiple,
+        "ExitBasis": exit_basis,
+        "ExitSource": "OVERRIDE" if exit_multiple_override else exit_auto["source"],
+        "BlendWeightPGM_Requested": float(blend_weight_pgm),
+        "BlendWeightPGM_Used": float(scenario_detail["Base"]["dcf_details"]["blend_weight_pgm_used"]),
+        "EV_Base": float(base_row["EV"]),
+        "Equity_Base": float(base_row["EquityValue"]) if not np.isnan(base_row["EquityValue"]) else np.nan,
+        "PerShare_Base": float(base_row["PerShare"]) if not np.isnan(base_row["PerShare"]) else np.nan,
     }
 
-    # Sensitivity on Base forecast
+    # Sensitivity (Base)
     base_fc = scenario_detail["Base"]["forecast_df"]
     wacc_grid = [round(x, 4) for x in [wacc - 0.02, wacc - 0.01, wacc, wacc + 0.01, wacc + 0.02] if x > 0]
     tg_grid = [round(x, 4) for x in [terminal_growth - 0.01, terminal_growth, terminal_growth + 0.01]]
@@ -687,48 +617,31 @@ def run_full_model(
         forecast_df=base_fc,
         wacc_grid=wacc_grid,
         tg_grid=tg_grid,
-        use_exit_multiple=use_exit_multiple,
         exit_multiple=float(exit_multiple) if not np.isnan(exit_multiple) else np.nan,
-        multiple_basis=multiple_basis,
+        exit_basis=exit_basis,
         blend_weight_pgm=float(blend_weight_pgm),
     )
 
-    # Inputs trace (for transparency)
     inputs_used = {
-        "ticker": ticker,
-        "forecast_years": forecast_years,
-        "fade_to_growth": fade_to_growth,
-        "tax_rate": tax,
-        "tax_override": tax_override,
-        "da_pct_rev": da_pct,
-        "da_override": da_override,
-        "capex_pct_rev": capex_pct,
-        "capex_override": capex_override,
-        "wc_pct_rev": wc_pct,
-        "wc_override": wc_override,
-        "shares": shares,
-        "shares_override": shares_override,
-        "net_debt": net_debt,
-        "net_debt_override": net_debt_override,
-        "wacc": wacc,
-        "wacc_override": wacc_override,
-        "rf": rf,
-        "erp": erp,
-        "beta": beta,
-        "beta_override": beta_override,
-        "cost_of_debt": cod,
-        "target_debt_weight_override": target_debt_weight_override,
-        "target_debt_weight_value": target_debt_weight_value,
-        "terminal_growth": terminal_growth,
-        "exit_multiple": exit_multiple,
-        "exit_multiple_override": exit_multiple_override,
-        "exit_multiple_basis": multiple_basis,
-        "blend_weight_pgm": blend_weight_pgm,
-        "scenario_deltas": {
-            "bull_growth_delta": bull_growth_delta,
-            "weak_growth_delta": weak_growth_delta,
-            "bull_margin_delta": bull_margin_delta,
-            "weak_margin_delta": weak_margin_delta,
+        "tax_rate_used": tax,
+        "driver_da_pct_rev_used": da_pct,
+        "driver_capex_pct_rev_used": capex_pct,
+        "driver_wc_pct_rev_used": wc_pct,
+        "exit_multiple_used": exit_multiple,
+        "exit_basis_used": exit_basis,
+        "wacc_used": wacc,
+        "wacc_build": wacc_build,
+        "overrides": {
+            "tax_override": tax_override,
+            "da_override": da_override,
+            "capex_override": capex_override,
+            "wc_override": wc_override,
+            "shares_override": shares_override,
+            "net_debt_override": net_debt_override,
+            "wacc_override": wacc_override,
+            "beta_override": beta_override,
+            "target_debt_weight_override": target_debt_weight_override,
+            "exit_multiple_override": exit_multiple_override,
         },
     }
 

@@ -1,0 +1,9 @@
+[theme]
+base="dark"
+primaryColor="#1f4fff"
+backgroundColor="#0b1c2d"
+secondaryBackgroundColor="#11263c"
+textColor="#ffffff"
+
+[client]
+toolbarMode="viewer"
